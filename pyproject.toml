@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bem"
+version = "0.1.0"
+description = "Steady blade-element momentum loads from spanwise chord, twist and aerofoil"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Sam Hughes", email = "s.hughes@ed.ac.uk" }]
+requires-python = ">=3.11"
+dependencies = ["numpy>=1.24"]
+keywords = ["blade element momentum", "aerodynamics", "wind turbine", "rotor"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/samhughes-fea/bem"
+Repository = "https://github.com/samhughes-fea/bem"
+Issues = "https://github.com/samhughes-fea/bem/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["bem*"]
+
+[tool.setuptools.package-data]
+bem = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
