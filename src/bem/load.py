@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from bem.stage_log import stage
+
 SectionPolar = Callable[[str, float], tuple[float, float, float]]
 
 _MAX_ITERATIONS = 80
@@ -157,6 +159,15 @@ def aerodynamic_load_case(
         point and the solved induction.
     """
 
+    with stage("bem", "bem"):
+        return _aerodynamic_load_case(outer_shape, operating_point, polar)
+
+
+def _aerodynamic_load_case(
+    outer_shape: OuterShape,
+    operating_point: OperatingPoint,
+    polar: SectionPolar,
+) -> AerodynamicLoadCase:
     if not isinstance(outer_shape, OuterShape):
         raise TypeError("outer_shape must be an OuterShape")
     if not isinstance(operating_point, OperatingPoint):
