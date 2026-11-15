@@ -17,8 +17,13 @@ from bem.stage_log import stage
 
 SectionPolar = Callable[[str, float], tuple[float, float, float]]
 
-_MAX_ITERATIONS = 80
+# Half-step iteration contracts linearly. At the RM1 station z = 2.35 m the
+# residual is still just above 1e-12 after 80 steps, and the fixed point is
+# an ordinary annular balance. 400 steps let that contraction finish. A
+# residual that never settles still raises the same non-convergence error.
+_MAX_ITERATIONS = 400
 _TOLERANCE = 1e-12
+_VANISHED_SPEED = 1e-14
 
 
 @dataclass(frozen=True)
@@ -243,6 +248,15 @@ def _solve_station(
             exc.iterations = iterations  # type: ignore[attr-defined]
             raise
         if max(abs(step.a_target - a), abs(step.a_prime_target - a_prime)) < _TOLERANCE:
+            # (1, -1) is a fixed point with no relative wind. The step that
+            # proposes it is evaluated just off that point, so the guard
+            # inside the step does not see the wind the targets would return.
+            axial = inflow.speed_m_s * (1.0 - step.a_target)
+            tangential = operating_point.rotor_speed_rad_s * radius * (1.0 + step.a_prime_target)
+            if math.hypot(axial, tangential) < _VANISHED_SPEED:
+                failed = RuntimeError(f"relative velocity vanished at z = {radius}")
+                failed.iterations = iterations  # type: ignore[attr-defined]
+                raise failed
             solved = step
             break
         a = a + 0.5 * (step.a_target - a)
@@ -296,7 +310,7 @@ def _momentum_step(
 ) -> _Station:
     axial = speed * (1.0 - a)
     tangential = omega * radius * (1.0 + a_prime)
-    if math.hypot(axial, tangential) < 1e-14:
+    if math.hypot(axial, tangential) < _VANISHED_SPEED:
         raise RuntimeError(f"relative velocity vanished at z = {radius}")
     inflow_angle = math.atan2(axial, tangential)
     angle_of_attack = inflow_angle - math.radians(twist_deg + pitch_deg)
