@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from bem.stage_log import stage
+
 SectionPolar = Callable[[str, float], tuple[float, float, float]]
 
 _MAX_ITERATIONS = 80
@@ -157,6 +159,17 @@ def aerodynamic_load_case(
         point and the solved induction.
     """
 
+    with stage("bem", "bem") as rec:
+        if isinstance(outer_shape, OuterShape):
+            rec.set("stations", len(outer_shape.z_m))
+        return _aerodynamic_load_case(outer_shape, operating_point, polar)
+
+
+def _aerodynamic_load_case(
+    outer_shape: OuterShape,
+    operating_point: OperatingPoint,
+    polar: SectionPolar,
+) -> AerodynamicLoadCase:
     if not isinstance(outer_shape, OuterShape):
         raise TypeError("outer_shape must be an OuterShape")
     if not isinstance(operating_point, OperatingPoint):
@@ -164,23 +177,31 @@ def aerodynamic_load_case(
     if not callable(polar):
         raise TypeError("polar must be callable")
 
-    rows = [
-        _solve_station(
-            radius=z,
-            chord=chord,
-            twist_deg=twist,
-            aerofoil=name,
-            operating_point=operating_point,
-            polar=polar,
-        )
-        for z, chord, twist, name in zip(
-            outer_shape.z_m,
-            outer_shape.chord_m,
-            outer_shape.twist_deg,
-            outer_shape.aerofoil,
-            strict=True,
-        )
-    ]
+    rows = []
+    for z, chord, twist, name in zip(
+        outer_shape.z_m,
+        outer_shape.chord_m,
+        outer_shape.twist_deg,
+        outer_shape.aerofoil,
+        strict=True,
+    ):
+        with stage("bem", "station") as rec:
+            try:
+                row, iterations = _solve_station(
+                    radius=z,
+                    chord=chord,
+                    twist_deg=twist,
+                    aerofoil=name,
+                    operating_point=operating_point,
+                    polar=polar,
+                )
+            except RuntimeError as exc:
+                taken = getattr(exc, "iterations", None)
+                if isinstance(taken, int) and not isinstance(taken, bool):
+                    rec.set("iterations", taken)
+                raise
+            rec.set("iterations", iterations)
+        rows.append(row)
     columns = zip(*rows, strict=True)
     arrays = [np.asarray(column, dtype=np.float64) for column in columns]
     return AerodynamicLoadCase(operating_point, *arrays)
@@ -194,36 +215,43 @@ def _solve_station(
     aerofoil: str,
     operating_point: OperatingPoint,
     polar: SectionPolar,
-) -> tuple[float, ...]:
-    """Return one station, starting with ``radius`` so the columns line up."""
+) -> tuple[tuple[float, ...], int]:
+    """Return one station, starting with ``radius``, and the iteration count."""
 
     inflow = operating_point.inflow
     a = 0.0
     a_prime = 0.0
     solved: _Station | None = None
-    for _ in range(_MAX_ITERATIONS):
-        step = _momentum_step(
-            radius=radius,
-            chord=chord,
-            twist_deg=twist_deg,
-            aerofoil=aerofoil,
-            speed=inflow.speed_m_s,
-            density=inflow.density_kg_m3,
-            omega=operating_point.rotor_speed_rad_s,
-            pitch_deg=operating_point.pitch_deg,
-            n_blades=operating_point.n_blades,
-            a=a,
-            a_prime=a_prime,
-            polar=polar,
-        )
+    iterations = 0
+    for iterations in range(1, _MAX_ITERATIONS + 1):
+        try:
+            step = _momentum_step(
+                radius=radius,
+                chord=chord,
+                twist_deg=twist_deg,
+                aerofoil=aerofoil,
+                speed=inflow.speed_m_s,
+                density=inflow.density_kg_m3,
+                omega=operating_point.rotor_speed_rad_s,
+                pitch_deg=operating_point.pitch_deg,
+                n_blades=operating_point.n_blades,
+                a=a,
+                a_prime=a_prime,
+                polar=polar,
+            )
+        except RuntimeError as exc:
+            exc.iterations = iterations  # type: ignore[attr-defined]
+            raise
         if max(abs(step.a_target - a), abs(step.a_prime_target - a_prime)) < _TOLERANCE:
             solved = step
             break
         a = a + 0.5 * (step.a_target - a)
         a_prime = a_prime + 0.5 * (step.a_prime_target - a_prime)
     if solved is None:
-        raise RuntimeError(f"blade-element momentum did not converge at z = {radius}")
-    return (
+        failed = RuntimeError(f"blade-element momentum did not converge at z = {radius}")
+        failed.iterations = iterations  # type: ignore[attr-defined]
+        raise failed
+    row = (
         radius,
         solved.lift,
         solved.drag,
@@ -235,6 +263,7 @@ def _solve_station(
         solved.a_target,
         solved.a_prime_target,
     )
+    return row, iterations
 
 
 @dataclass(frozen=True)
