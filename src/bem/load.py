@@ -162,6 +162,14 @@ def aerodynamic_load_case(
     AerodynamicLoadCase
         Lift, drag and pitch moment in the blade frame, with the operating
         point and the solved induction.
+
+    Raises
+    ------
+    RuntimeError
+        ``relative velocity vanished at z = ...`` when the induction at a
+        station cancels the relative wind. The error carries that station's
+        ``axial_induction``, ``tangential_induction`` and ``radius``. The
+        station is not returned as a load and is not dropped.
     """
 
     with stage("bem", "bem") as rec:
@@ -254,7 +262,9 @@ def _solve_station(
             axial = inflow.speed_m_s * (1.0 - step.a_target)
             tangential = operating_point.rotor_speed_rad_s * radius * (1.0 + step.a_prime_target)
             if math.hypot(axial, tangential) < _VANISHED_SPEED:
-                failed = RuntimeError(f"relative velocity vanished at z = {radius}")
+                failed = _vanished_wind(
+                    radius, step.a_target, step.a_prime_target
+                )
                 failed.iterations = iterations  # type: ignore[attr-defined]
                 raise failed
             solved = step
@@ -293,6 +303,23 @@ class _Station:
     a_prime_target: float
 
 
+def _vanished_wind(
+    radius: float, axial_induction: float, tangential_induction: float
+) -> RuntimeError:
+    """The induction at ``radius`` cancelled the relative wind.
+
+    The message stays ``relative velocity vanished at z = ...``. Axial and
+    tangential induction, and the radius, stay on the error so the failed
+    station is still identifiable. Callers do not receive a load.
+    """
+
+    failed = RuntimeError(f"relative velocity vanished at z = {radius}")
+    failed.radius = radius  # type: ignore[attr-defined]
+    failed.axial_induction = axial_induction  # type: ignore[attr-defined]
+    failed.tangential_induction = tangential_induction  # type: ignore[attr-defined]
+    return failed
+
+
 def _momentum_step(
     *,
     radius: float,
@@ -311,7 +338,7 @@ def _momentum_step(
     axial = speed * (1.0 - a)
     tangential = omega * radius * (1.0 + a_prime)
     if math.hypot(axial, tangential) < _VANISHED_SPEED:
-        raise RuntimeError(f"relative velocity vanished at z = {radius}")
+        raise _vanished_wind(radius, a, a_prime)
     inflow_angle = math.atan2(axial, tangential)
     angle_of_attack = inflow_angle - math.radians(twist_deg + pitch_deg)
     cl, cd, cm = _coefficients(polar, aerofoil, angle_of_attack)

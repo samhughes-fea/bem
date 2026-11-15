@@ -144,5 +144,48 @@ def test_a_cancelled_relative_wind_is_not_accepted():
         del aerofoil, alpha_rad
         return 0.1, 0.02, 0.0
 
-    with pytest.raises(RuntimeError, match="relative velocity vanished at z = 10.0"):
+    with pytest.raises(RuntimeError, match="relative velocity vanished at z = 10.0") as caught:
         aerodynamic_load_case(outer, operating_point, polar)
+    error = caught.value
+    assert error.axial_induction == pytest.approx(1.0, abs=1e-12)
+    assert error.tangential_induction == pytest.approx(-1.0, abs=1e-12)
+    assert error.radius == 10.0
+
+
+def test_cut_in_at_3_55_m_keeps_the_induction_that_cancelled_the_wind():
+    """Cases 2.1@U_in and 4.1@U_in stop here, and the error keeps the cause.
+
+    Radius 3.55 m is the RM1 hub radius, 1 m, plus the AeroDyn station at
+    2.55 m (chord 1.577 m, twist 9.50 deg). The operating point is the same
+    cut-in used at 2.35 m. From this radius outward the iteration settles on
+    induction (1, -1), which cancels the relative wind. The error still
+    names the station, and it carries that axial induction, that tangential
+    induction and the radius. It is not replaced by a load.
+    """
+
+    radius = 3.55
+    omega = 11.5 * math.pi / 30.0
+    outer = OuterShape(
+        z_m=(radius,),
+        chord_m=(1.577,),
+        twist_deg=(9.50,),
+        aerofoil=("af9",),
+    )
+    operating_point = OperatingPoint(
+        inflow=Inflow(speed_m_s=0.5, density_kg_m3=1025.0),
+        rotor_speed_rad_s=omega,
+        pitch_deg=0.0,
+        n_blades=2,
+    )
+
+    def polar(aerofoil: str, alpha_rad: float) -> tuple[float, float, float]:
+        del aerofoil, alpha_rad
+        return 0.1, 0.02, 0.0
+
+    with pytest.raises(RuntimeError, match="relative velocity vanished at z = 3.55") as caught:
+        aerodynamic_load_case(outer, operating_point, polar)
+    error = caught.value
+    assert error.axial_induction == pytest.approx(1.0, abs=1e-12)
+    assert error.tangential_induction == pytest.approx(-1.0, abs=1e-12)
+    assert error.radius == radius
+    assert type(error) is RuntimeError
