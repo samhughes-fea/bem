@@ -138,9 +138,9 @@ class AerodynamicLoadCase:
     nose-up (the same sense as positive pitch).
 
     Arrays have shape ``(n,)`` in station order. ``operating_point`` is the
-    condition that was solved. Inflow angle, angle of attack, induction and
-    the Prandtl loss factor are the solved state at each station. The default
-    annular solve stores a loss factor of 1.
+    condition that was solved. Inflow angle, angle of attack, induction, the
+    Prandtl loss factor and the induction iteration history are the solved
+    state at each station. The default annular solve stores a loss factor of 1.
     """
 
     operating_point: OperatingPoint
@@ -156,6 +156,7 @@ class AerodynamicLoadCase:
     tangential_induction: np.ndarray
     loss_factor: np.ndarray | None = None
     loss_model: str = LOSS_NONE
+    convergence_history: tuple[np.ndarray, ...] = ()
 
     def __post_init__(self) -> None:
         if self.loss_model not in LOSS_MODELS:
@@ -163,6 +164,15 @@ class AerodynamicLoadCase:
         if self.loss_factor is None:
             object.__setattr__(
                 self, "loss_factor", np.ones(np.asarray(self.z_m).shape, dtype=np.float64))
+        history = tuple(np.asarray(item, dtype=np.float64) for item in self.convergence_history)
+        if history and len(history) != np.asarray(self.z_m).shape[0]:
+            raise ValueError("convergence_history length must equal the number of stations")
+        for item in history:
+            if item.ndim != 2 or item.shape[1] != 3:
+                raise ValueError(
+                    "each station history must have shape (n_iterations, 3): "
+                    "axial induction, tangential induction, residual")
+        object.__setattr__(self, "convergence_history", history)
 
 
 def aerodynamic_load_case(
@@ -195,7 +205,8 @@ def aerodynamic_load_case(
     -------
     AerodynamicLoadCase
         Lift, drag and pitch moment in the blade frame, with the operating
-        point, the solved induction and the loss factor.
+        point, the solved induction, the loss factor and the induction
+        iteration history at each station.
 
     Raises
     ------
@@ -230,6 +241,7 @@ def _aerodynamic_load_case(
     hub, tip = _loss_extents(outer_shape, model)
 
     rows = []
+    histories: list[np.ndarray] = []
     for z, chord, twist, name in zip(
         outer_shape.z_m,
         outer_shape.chord_m,
@@ -239,7 +251,7 @@ def _aerodynamic_load_case(
     ):
         with stage("bem", "station") as rec:
             try:
-                row, iterations = _solve_station(
+                row, iterations, history = _solve_station(
                     radius=z,
                     chord=chord,
                     twist_deg=twist,
@@ -257,9 +269,12 @@ def _aerodynamic_load_case(
                 raise
             rec.set("iterations", iterations)
         rows.append(row)
+        histories.append(history)
     columns = zip(*rows, strict=True)
     arrays = [np.asarray(column, dtype=np.float64) for column in columns]
-    return AerodynamicLoadCase(operating_point, *arrays, loss_model=model)
+    return AerodynamicLoadCase(
+        operating_point, *arrays, loss_model=model, convergence_history=tuple(histories),
+    )
 
 
 def _solve_station(
@@ -273,14 +288,19 @@ def _solve_station(
     loss_model: str,
     hub_radius: float | None,
     tip_radius: float | None,
-) -> tuple[tuple[float, ...], int]:
-    """Return one station, starting with ``radius``, and the iteration count."""
+) -> tuple[tuple[float, ...], int, np.ndarray]:
+    """Return one station, the iteration count, and the induction history.
+
+    The history has one row per iterate: axial induction, tangential
+    induction and the residual ``max(|a* - a|, |a'* - a'|)``.
+    """
 
     inflow = operating_point.inflow
     a = 0.0
     a_prime = 0.0
     solved: _Station | None = None
     iterations = 0
+    history: list[tuple[float, float, float]] = []
     for iterations in range(1, _MAX_ITERATIONS + 1):
         try:
             step = _momentum_step(
@@ -303,7 +323,9 @@ def _solve_station(
         except RuntimeError as exc:
             exc.iterations = iterations  # type: ignore[attr-defined]
             raise
-        if max(abs(step.a_target - a), abs(step.a_prime_target - a_prime)) < _TOLERANCE:
+        residual = max(abs(step.a_target - a), abs(step.a_prime_target - a_prime))
+        history.append((step.a_target, step.a_prime_target, residual))
+        if residual < _TOLERANCE:
             # (1, -1) is a fixed point with no relative wind. The step that
             # proposes it is evaluated just off that point, so the guard
             # inside the step does not see the wind the targets would return.
@@ -336,7 +358,7 @@ def _solve_station(
         solved.a_prime_target,
         solved.loss_factor,
     )
-    return row, iterations
+    return row, iterations, np.asarray(history, dtype=np.float64)
 
 
 @dataclass(frozen=True)

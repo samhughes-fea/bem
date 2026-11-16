@@ -22,7 +22,7 @@ Lift and drag are the section forces perpendicular to and along the relative win
 
 The default balance is the steady annular momentum solution, with no tip loss, hub loss or turbulent-wake correction. `loss_model="prandtl"` applies Prandtl tip and hub loss. `loss_model="prandtl_buhl"` applies that loss and Buhl's high-induction correction. Neither is the default. Those variants need `hub_radius_m` and `tip_radius_m` on the outer shape. The loss factor at each station is stored on the load case.
 
-`operating_point` stores the inflow, rotor speed, pitch and blade count. Inflow angle, angle of attack, induction and the loss factor are stored at each station. The pitching moment is taken from the polar's `Cm`.
+`operating_point` stores the inflow, rotor speed, pitch and blade count. Inflow angle, angle of attack, induction, the loss factor and the induction iteration history are stored at each station. Each station history is `(n_iterations, 3)`: axial induction, tangential induction and residual. The pitching moment is taken from the polar's `Cm`.
 
 ## Public API
 
