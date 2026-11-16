@@ -1,8 +1,10 @@
 """Blade-element momentum loads in the blade frame.
 
-The momentum balance is the steady annular solution: no tip loss, no hub
-loss and no turbulent-wake correction. One blade is solved. ``n_blades``
-enters only through the rotor solidity.
+The default momentum balance is the steady annular solution: no tip loss, no
+hub loss and no turbulent-wake correction. Prandtl tip and hub loss, and the
+Buhl high-induction correction, are a labelled variant of that balance. One
+blade is solved. ``n_blades`` enters through the rotor solidity and, when
+Prandtl loss is selected, through the loss factor.
 """
 
 from __future__ import annotations
@@ -13,6 +15,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from bem.losses import (
+    LOSS_MODELS,
+    LOSS_NONE,
+    LOSS_PRANDTL_BUHL,
+    axial_induction,
+    prandtl_factor,
+)
 from bem.stage_log import stage
 
 SectionPolar = Callable[[str, float], tuple[float, float, float]]
@@ -81,13 +90,16 @@ class OuterShape:
     ``z_m`` is the distance from the rotor axis, in metres, strictly
     increasing. ``twist_deg`` is positive when it rotates the nose toward the
     axial inflow (it is subtracted from the inflow angle). ``aerofoil`` is the
-    label passed to the section polar at that station.
+    label passed to the section polar at that station. ``hub_radius_m`` and
+    ``tip_radius_m`` are required for Prandtl tip and hub loss.
     """
 
     z_m: Sequence[float]
     chord_m: Sequence[float]
     twist_deg: Sequence[float]
     aerofoil: Sequence[str]
+    hub_radius_m: float | None = None
+    tip_radius_m: float | None = None
 
     def __post_init__(self) -> None:
         z = tuple(_finite("z", value) for value in self.z_m)
@@ -107,10 +119,13 @@ class OuterShape:
             raise ValueError("chord must be positive")
         if any(not isinstance(name, str) or not name.strip() for name in aerofoil):
             raise ValueError("each aerofoil must be a non-empty string")
+        hub, tip = _extents(self.hub_radius_m, self.tip_radius_m, z)
         object.__setattr__(self, "z_m", z)
         object.__setattr__(self, "chord_m", chord)
         object.__setattr__(self, "twist_deg", twist)
         object.__setattr__(self, "aerofoil", aerofoil)
+        object.__setattr__(self, "hub_radius_m", hub)
+        object.__setattr__(self, "tip_radius_m", tip)
 
 
 @dataclass(frozen=True)
@@ -123,8 +138,9 @@ class AerodynamicLoadCase:
     nose-up (the same sense as positive pitch).
 
     Arrays have shape ``(n,)`` in station order. ``operating_point`` is the
-    condition that was solved. Inflow angle, angle of attack and induction are
-    the solved state at each station.
+    condition that was solved. Inflow angle, angle of attack, induction and
+    the Prandtl loss factor are the solved state at each station. The default
+    annular solve stores a loss factor of 1.
     """
 
     operating_point: OperatingPoint
@@ -138,12 +154,23 @@ class AerodynamicLoadCase:
     angle_of_attack_rad: np.ndarray
     axial_induction: np.ndarray
     tangential_induction: np.ndarray
+    loss_factor: np.ndarray | None = None
+    loss_model: str = LOSS_NONE
+
+    def __post_init__(self) -> None:
+        if self.loss_model not in LOSS_MODELS:
+            raise ValueError(f"loss_model must be one of {list(LOSS_MODELS)}")
+        if self.loss_factor is None:
+            object.__setattr__(
+                self, "loss_factor", np.ones(np.asarray(self.z_m).shape, dtype=np.float64))
 
 
 def aerodynamic_load_case(
     outer_shape: OuterShape,
     operating_point: OperatingPoint,
     polar: SectionPolar,
+    *,
+    loss_model: str = LOSS_NONE,
 ) -> AerodynamicLoadCase:
     """Solve steady blade-element momentum at each outer-shape station.
 
@@ -151,17 +178,24 @@ def aerodynamic_load_case(
     ----------
     outer_shape
         Chord, twist and aerofoil along the span. ``z`` is the radius.
+        Prandtl loss also needs ``hub_radius_m`` and ``tip_radius_m``.
     operating_point
         Axial inflow, rotor speed, collective pitch and blade count.
     polar
         ``(aerofoil, alpha_rad) -> (Cl, Cd, Cm)``. ``Cm`` is positive nose-up.
         The pitch moment is ``0.5 ρ W² c² Cm`` about the polar reference axis.
+        The coefficient is taken from the polar; this solver does not replace
+        it with zero.
+    loss_model
+        ``none`` is the default annular balance. ``prandtl`` applies Prandtl
+        tip and hub loss. ``prandtl_buhl`` applies that loss and Buhl's
+        high-induction correction. Neither is the default.
 
     Returns
     -------
     AerodynamicLoadCase
         Lift, drag and pitch moment in the blade frame, with the operating
-        point and the solved induction.
+        point, the solved induction and the loss factor.
 
     Raises
     ------
@@ -175,13 +209,16 @@ def aerodynamic_load_case(
     with stage("bem", "bem") as rec:
         if isinstance(outer_shape, OuterShape):
             rec.set("stations", len(outer_shape.z_m))
-        return _aerodynamic_load_case(outer_shape, operating_point, polar)
+        return _aerodynamic_load_case(
+            outer_shape, operating_point, polar, loss_model=loss_model)
 
 
 def _aerodynamic_load_case(
     outer_shape: OuterShape,
     operating_point: OperatingPoint,
     polar: SectionPolar,
+    *,
+    loss_model: str,
 ) -> AerodynamicLoadCase:
     if not isinstance(outer_shape, OuterShape):
         raise TypeError("outer_shape must be an OuterShape")
@@ -189,6 +226,8 @@ def _aerodynamic_load_case(
         raise TypeError("operating_point must be an OperatingPoint")
     if not callable(polar):
         raise TypeError("polar must be callable")
+    model = _loss_model(loss_model)
+    hub, tip = _loss_extents(outer_shape, model)
 
     rows = []
     for z, chord, twist, name in zip(
@@ -207,6 +246,9 @@ def _aerodynamic_load_case(
                     aerofoil=name,
                     operating_point=operating_point,
                     polar=polar,
+                    loss_model=model,
+                    hub_radius=hub,
+                    tip_radius=tip,
                 )
             except RuntimeError as exc:
                 taken = getattr(exc, "iterations", None)
@@ -217,7 +259,7 @@ def _aerodynamic_load_case(
         rows.append(row)
     columns = zip(*rows, strict=True)
     arrays = [np.asarray(column, dtype=np.float64) for column in columns]
-    return AerodynamicLoadCase(operating_point, *arrays)
+    return AerodynamicLoadCase(operating_point, *arrays, loss_model=model)
 
 
 def _solve_station(
@@ -228,6 +270,9 @@ def _solve_station(
     aerofoil: str,
     operating_point: OperatingPoint,
     polar: SectionPolar,
+    loss_model: str,
+    hub_radius: float | None,
+    tip_radius: float | None,
 ) -> tuple[tuple[float, ...], int]:
     """Return one station, starting with ``radius``, and the iteration count."""
 
@@ -251,6 +296,9 @@ def _solve_station(
                 a=a,
                 a_prime=a_prime,
                 polar=polar,
+                loss_model=loss_model,
+                hub_radius=hub_radius,
+                tip_radius=tip_radius,
             )
         except RuntimeError as exc:
             exc.iterations = iterations  # type: ignore[attr-defined]
@@ -286,6 +334,7 @@ def _solve_station(
         solved.angle_of_attack,
         solved.a_target,
         solved.a_prime_target,
+        solved.loss_factor,
     )
     return row, iterations
 
@@ -301,6 +350,7 @@ class _Station:
     angle_of_attack: float
     a_target: float
     a_prime_target: float
+    loss_factor: float
 
 
 def _vanished_wind(
@@ -334,6 +384,9 @@ def _momentum_step(
     a: float,
     a_prime: float,
     polar: SectionPolar,
+    loss_model: str,
+    hub_radius: float | None,
+    tip_radius: float | None,
 ) -> _Station:
     axial = speed * (1.0 - a)
     tangential = omega * radius * (1.0 + a_prime)
@@ -348,14 +401,10 @@ def _momentum_step(
     solidity = n_blades * chord / (2.0 * math.pi * radius)
     normal = cl * cos_phi + cd * sin_phi
     tangent = cl * sin_phi - cd * cos_phi
-    axial_denominator = 4.0 * sin_phi * sin_phi + solidity * normal
-    swirl_denominator = 4.0 * sin_phi * cos_phi - solidity * tangent
-    if abs(axial_denominator) < 1e-14 or abs(swirl_denominator) < 1e-14:
-        raise RuntimeError(f"momentum balance is singular at z = {radius}")
-    a_target = solidity * normal / axial_denominator
-    a_prime_target = solidity * tangent / swirl_denominator
-    if not math.isfinite(a_target) or not math.isfinite(a_prime_target):
-        raise RuntimeError(f"momentum balance is singular at z = {radius}")
+    factor = _loss_factor(
+        loss_model, radius, inflow_angle, n_blades, hub_radius, tip_radius)
+    a_target, a_prime_target = _induction_targets(
+        radius, solidity, sin_phi, cos_phi, normal, tangent, factor, loss_model)
 
     dynamic_pressure = 0.5 * density * (axial * axial + tangential * tangential)
     lift = dynamic_pressure * chord * cl
@@ -377,7 +426,91 @@ def _momentum_step(
         angle_of_attack=angle_of_attack,
         a_target=a_target,
         a_prime_target=a_prime_target,
+        loss_factor=factor,
     )
+
+
+def _induction_targets(
+    radius: float,
+    solidity: float,
+    sin_phi: float,
+    cos_phi: float,
+    normal: float,
+    tangent: float,
+    factor: float,
+    loss_model: str,
+) -> tuple[float, float]:
+    """Axial and tangential induction from the blade-element loading.
+
+    The default annular balance is unchanged. Prandtl multiplies the momentum
+    annulus by ``F``. Buhl replaces the axial induction when ``k > 2/3``.
+    """
+
+    swirl_denominator = 4.0 * factor * sin_phi * cos_phi - solidity * tangent
+    if abs(swirl_denominator) < 1e-14:
+        raise RuntimeError(f"momentum balance is singular at z = {radius}")
+    a_prime = solidity * tangent / swirl_denominator
+    if loss_model == LOSS_PRANDTL_BUHL:
+        axial_weight = 4.0 * factor * sin_phi * sin_phi
+        if abs(axial_weight) < 1e-14:
+            raise RuntimeError(f"momentum balance is singular at z = {radius}")
+        k = solidity * normal / axial_weight
+        a = axial_induction(k, factor, buhl=True)
+    else:
+        axial_denominator = 4.0 * factor * sin_phi * sin_phi + solidity * normal
+        if abs(axial_denominator) < 1e-14:
+            raise RuntimeError(f"momentum balance is singular at z = {radius}")
+        a = solidity * normal / axial_denominator
+    if not math.isfinite(a) or not math.isfinite(a_prime):
+        raise RuntimeError(f"momentum balance is singular at z = {radius}")
+    return a, a_prime
+
+
+def _loss_factor(
+    loss_model: str,
+    radius: float,
+    inflow_angle: float,
+    n_blades: int,
+    hub_radius: float | None,
+    tip_radius: float | None,
+) -> float:
+    if loss_model == LOSS_NONE:
+        return 1.0
+    if hub_radius is None or tip_radius is None:
+        raise ValueError("Prandtl tip and hub loss needs hub_radius_m and tip_radius_m")
+    return prandtl_factor(radius, inflow_angle, n_blades, hub_radius, tip_radius)
+
+
+def _loss_model(value: str) -> str:
+    if value not in LOSS_MODELS:
+        raise ValueError(f"loss_model must be one of {list(LOSS_MODELS)}")
+    return value
+
+
+def _loss_extents(shape: OuterShape, loss_model: str) -> tuple[float | None, float | None]:
+    if loss_model == LOSS_NONE:
+        return shape.hub_radius_m, shape.tip_radius_m
+    if shape.hub_radius_m is None or shape.tip_radius_m is None:
+        raise ValueError("Prandtl tip and hub loss needs hub_radius_m and tip_radius_m")
+    return shape.hub_radius_m, shape.tip_radius_m
+
+
+def _extents(
+    hub: float | None, tip: float | None, z: tuple[float, ...],
+) -> tuple[float | None, float | None]:
+    if hub is None and tip is None:
+        return None, None
+    if hub is None or tip is None:
+        raise ValueError("hub_radius_m and tip_radius_m must be set together")
+    hub_m = _finite("hub radius", hub)
+    tip_m = _finite("tip radius", tip)
+    if hub_m <= 0.0:
+        raise ValueError("hub radius must be positive")
+    if tip_m <= hub_m:
+        raise ValueError("tip radius must be greater than hub radius")
+    if any(radius < hub_m or radius > tip_m for radius in z):
+        raise ValueError("z must lie between the hub radius and the tip radius")
+    return hub_m, tip_m
 
 
 def _coefficients(polar: SectionPolar, aerofoil: str, alpha: float) -> tuple[float, float, float]:
