@@ -20,7 +20,9 @@ Positive twist and positive pitch rotate the nose toward the axial inflow. Both 
 
 Lift and drag are the section forces perpendicular to and along the relative wind. The load case reports those magnitudes and their resultant, `force_x_n_per_m` and `force_y_n_per_m`, in the blade frame. Pitch moment is per unit span, positive nose-up, and is `0.5 ρ W² c² Cm` from the polar.
 
-The balance is the steady annular momentum solution, with no tip loss, hub loss or turbulent-wake correction. `operating_point` stores the inflow, rotor speed, pitch and blade count. Inflow angle, angle of attack and induction are stored at each station.
+The default balance is the steady annular momentum solution, with no tip loss, hub loss or turbulent-wake correction. `loss_model="prandtl"` applies Prandtl tip and hub loss. `loss_model="prandtl_buhl"` applies that loss and Buhl's high-induction correction. Neither is the default. Those variants need `hub_radius_m` and `tip_radius_m` on the outer shape. The loss factor at each station is stored on the load case.
+
+`operating_point` stores the inflow, rotor speed, pitch and blade count. Inflow angle, angle of attack, induction and the loss factor are stored at each station. The pitching moment is taken from the polar's `Cm`.
 
 ## Public API
 
@@ -44,9 +46,11 @@ def polar(aerofoil: str, alpha_rad: float) -> tuple[float, float, float]:
     return 0.0, 0.04, 0.02  # Cl, Cd, Cm; Cm is positive nose-up
 
 case = aerodynamic_load_case(outer, point, polar)
+# labelled variant: Prandtl tip and hub loss and Buhl's correction
+# case = aerodynamic_load_case(outer, point, polar, loss_model="prandtl_buhl")
 ```
 
-A polar may use `alpha_rad`. `Cm` is about the polar reference axis.
+A polar may use `alpha_rad`. `Cm` is about the polar reference axis. The solver does not replace it with zero.
 
 ## Licence
 
